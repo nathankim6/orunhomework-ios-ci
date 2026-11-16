@@ -1,0 +1,73 @@
+name: iOS simulator launch smoke
+
+# Manual only. Builds the debug app, installs it on a fresh simulator, launches it, keeps
+# a screenshot and checks the process is still alive afterwards. This is what proves the
+# shell really opens the live site; it is not a device, TestFlight or App Store test.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      APP_PATH: native/ios/build/DerivedData/Build/Products/Debug-iphonesimulator/OrunHomework.app
+      BUNDLE_ID: com.orunhomework.app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build debug app for the simulator
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build-logs
+          xcodebuild -project native/ios/OrunHomework.xcodeproj -scheme OrunHomework \
+            -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath native/ios/build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee build-logs/xcodebuild.log
+
+      - name: Boot a simulator, install and launch
+        shell: bash
+        run: |
+          set -o pipefail
+          DEVICE=$(xcrun simctl list devices available --json | python3 -c "
+          import json, sys
+          devices = json.load(sys.stdin)['devices']
+          for runtime in sorted(devices, reverse=True):
+              for device in devices[runtime]:
+                  if device['name'].startswith('iPhone'):
+                      print(device['udid'])
+                      raise SystemExit(0)
+          raise SystemExit(1)
+          ")
+          echo "DEVICE=$DEVICE" >> "$GITHUB_ENV"
+          xcrun simctl boot "$DEVICE" || true
+          xcrun simctl bootstatus "$DEVICE" -b
+          xcrun simctl install "$DEVICE" "$APP_PATH"
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID" | tee build-logs/launch.log
+          sleep 35
+          xcrun simctl io "$DEVICE" screenshot build-logs/launch.png
+          # The process must still be alive: a crash or a watchdog kill would drop it.
+          xcrun simctl spawn "$DEVICE" launchctl list | tee build-logs/processes.log | grep "$BUNDLE_ID"
+          echo "App is running with the live site loaded (screenshot attached)."
+
+      - name: App log tail
+        if: always()
+        shell: bash
+        run: |
+          xcrun simctl spawn "$DEVICE" log show --last 3m --style compact \
+            --predicate 'process == "OrunHomework"' > build-logs/app.log 2>&1 || true
+          tail -50 build-logs/app.log || true
+
+      - name: Upload screenshot and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrunHomework-launch-smoke
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 14

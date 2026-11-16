@@ -1,0 +1,136 @@
+name: Build signed App Store IPA
+
+# Manual only. Builds a Release archive signed with the App Store distribution identity and
+# exports an IPA for upload through Xcode Organizer or Transporter. This workflow does not
+# upload, submit, or create an App Store Connect record, and it never touches agreements.
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: App Store build number (must be higher than the last uploaded build)
+        required: true
+        default: '1'
+      marketing_version:
+        description: Marketing version (for example 1.1.0)
+        required: true
+        default: '1.1.0'
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      BUILD_NUMBER: ${{ inputs.build_number }}
+      MARKETING_VERSION: ${{ inputs.marketing_version }}
+      TEAM_ID: 4RBXVT9Q86
+      BUNDLE_ID: com.orunhomework.app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "build_number must be a positive integer"; exit 1; }
+          [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || { echo "marketing_version must look like 1.1.0"; exit 1; }
+
+      - name: Install signing assets into a temporary keychain
+        shell: bash
+        env:
+          P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$P12_BASE64" && test -n "$P12_PASSWORD" && test -n "$PROFILE_BASE64"
+          KEYCHAIN_PATH="$RUNNER_TEMP/orunhomework-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/homework.mobileprovision"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/dist.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH" > /dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
+          security cms -D -i "$RUNNER_TEMP/homework.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")"
+          echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")" = "$TEAM_ID.$BUNDLE_ID"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$RUNNER_TEMP/profile.plist")" = "false"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$RUNNER_TEMP/homework.mobileprovision" "$dir/$UUID.mobileprovision"
+          done
+          echo "Signing with profile: $PROFILE_NAME"
+
+      - name: Archive iPhone and iPad release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native/ios/build
+          xcodebuild -project native/ios/OrunHomework.xcodeproj -scheme OrunHomework \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/native/ios/build/OrunHomework.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY='Apple Distribution' PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            MARKETING_VERSION="$MARKETING_VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            archive 2>&1 | tee native/ios/build/archive.log
+          /usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleIdentifier' \
+            native/ios/build/OrunHomework.xcarchive/Info.plist | grep -x "$BUNDLE_ID"
+
+      - name: Export App Store IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>method</key><string>app-store-connect</string>
+          <key>destination</key><string>export</string>
+          <key>teamID</key><string>${TEAM_ID}</string>
+          <key>signingStyle</key><string>manual</string>
+          <key>signingCertificate</key><string>Apple Distribution</string>
+          <key>manageAppVersionAndBuildNumber</key><false/>
+          <key>stripSwiftSymbols</key><true/>
+          <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string></dict>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$PWD/native/ios/build/OrunHomework.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$PWD/native/ios/build/export" 2>&1 | tee native/ios/build/export.log
+          codesign --verify --deep --strict native/ios/build/OrunHomework.xcarchive/Products/Applications/OrunHomework.app
+          test -n "$(find native/ios/build/export -name '*.ipa' -print -quit)"
+
+      - name: Report signed build
+        if: always()
+        shell: bash
+        run: |
+          IPA="$(find native/ios/build/export -name '*.ipa' -print -quit 2>/dev/null || true)"
+          if [ -n "$IPA" ]; then
+            echo "IPA: $IPA"
+            shasum -a 256 "$IPA" | tee native/ios/build/ipa-sha256.log
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OrunHomework-AppStore-build-${{ inputs.build_number }}
+          path: |
+            native/ios/build/export/*.ipa
+            native/ios/build/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove temporary signing assets
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${KEYCHAIN_PATH:-}" ] && security delete-keychain "$KEYCHAIN_PATH" || true
+          rm -f "$RUNNER_TEMP/dist.p12" "$RUNNER_TEMP/homework.mobileprovision" "$RUNNER_TEMP/profile.plist"
