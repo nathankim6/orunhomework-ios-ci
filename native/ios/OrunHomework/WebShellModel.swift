@@ -67,8 +67,7 @@ final class WebShellModel: NSObject, ObservableObject {
     private var probeInFlight = false
     private var incoming: IncomingFile?
     private var transferTimer: Timer?
-    private var pendingDownload: WKDownload?
-    private var downloadDestination: URL?
+    private var downloadTask: URLSessionDownloadTask?
 
     private struct IncomingFile {
         let destination: URL
@@ -93,7 +92,7 @@ final class WebShellModel: NSObject, ObservableObject {
 
         let controller = webView.configuration.userContentController
         controller.add(shellProxy, contentWorld: .page, name: "orunShell")
-        controller.add(fileProxy, contentWorld: .page, name: "orunFile")
+        controller.addScriptMessageHandler(fileProxy, contentWorld: .page, name: "orunFile")
         controller.addUserScript(WKUserScript(source: WebShellScripts.captureTracker,
                                              injectionTime: .atDocumentStart,
                                              forMainFrameOnly: true,
@@ -137,7 +136,7 @@ final class WebShellModel: NSObject, ObservableObject {
     /// really changed, only on the site's entry screen, and never during a recording.
     func refreshIfStale() {
         guard failure == nil, !isLoading, !webView.isLoading, !captureActive,
-              incoming == nil, pendingDownload == nil, !probeInFlight else { return }
+              incoming == nil, downloadTask == nil, !probeInFlight else { return }
         guard isAtRoot() else { return }
         if let lastProbeDate, Date().timeIntervalSince(lastProbeDate) < ShellLimits.buildProbeInterval { return }
         probeInFlight = true
@@ -178,7 +177,7 @@ final class WebShellModel: NSObject, ObservableObject {
         }.resume()
     }
 
-    // MARK: - WKNavigationDelegate
+    // MARK: - Site build identity
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         guard webView === self.webView else { return }
@@ -218,6 +217,8 @@ final class WebShellModel: NSObject, ObservableObject {
         failure = "숙제 화면을 열지 못했어요.\n인터넷 연결을 확인한 뒤 다시 시도해 주세요."
     }
 
+    // MARK: - Navigation policy
+
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
 
@@ -238,12 +239,18 @@ final class WebShellModel: NSObject, ObservableObject {
             return
         }
 
-        if Site.isTrusted(url) || url.absoluteString == "about:blank" {
+        if Site.isTrusted(url) {
             if navigationAction.shouldPerformDownload {
-                decisionHandler(.download)
+                decisionHandler(.cancel)
+                startDownload(url)
             } else {
                 decisionHandler(.allow)
             }
+            return
+        }
+
+        if url.absoluteString == "about:blank" {
+            decisionHandler(.allow)
             return
         }
 
@@ -260,7 +267,8 @@ final class WebShellModel: NSObject, ObservableObject {
                 decisionHandler(.cancel)
                 return
             }
-            decisionHandler(.download)
+            decisionHandler(.cancel)
+            startDownload(response.url)
             return
         }
         decisionHandler(.allow)
@@ -297,75 +305,64 @@ final class WebShellModel: NSObject, ObservableObject {
         decisionHandler(.grant)
     }
 
-    // MARK: - Downloads initiated by the site (WKDownload path)
+    // MARK: - Server files (report PDFs, attachments)
 
-    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        adopt(download)
-    }
-
-    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        adopt(download)
-    }
-
-    private func adopt(_ download: WKDownload) {
-        guard pendingDownload == nil, incoming == nil, Site.isTrusted(download.originalRequest?.url) else {
-            download.cancel { _ in }
-            alertMessage = "파일을 저장하지 못했어요. 잠시 후 다시 시도해 주세요."
+    /// Downloads a server file with the web view's own cookies, so a link that works in
+    /// the page works here too, and hands it to the share sheet.
+    private func startDownload(_ url: URL) {
+        guard downloadTask == nil, incoming == nil else {
+            alertMessage = "다른 파일을 저장하는 중이에요. 끝난 뒤 다시 시도해 주세요."
             return
         }
-        pendingDownload = download
-        download.delegate = self
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            let fields = HTTPCookie.requestHeaderFields(with: cookies)
+            Task { @MainActor in
+                self?.performDownload(url, cookieFields: fields)
+            }
+        }
     }
 
-    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping @MainActor @Sendable (URL?) -> Void) {
-        guard download === pendingDownload,
-              Site.isTrusted(response.url),
-              let http = response as? HTTPURLResponse,
-              (200...299).contains(http.statusCode),
-              response.expectedContentLength <= Int64(ShellLimits.fileSize) else {
-            completionHandler(nil)
-            finishDownloadFailure()
+    private func performDownload(_ url: URL, cookieFields: [String: String]) {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+        for (name, value) in cookieFields {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        let task = URLSession.shared.downloadTask(with: request) { [weak self] temporaryURL, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let suggested = response?.suggestedFilename
+            let contentType = response?.mimeType
+            let expected = response?.expectedContentLength ?? -1
+            Task { @MainActor in
+                self?.finishDownload(temporaryURL: temporaryURL,
+                                     status: status,
+                                     suggestedName: suggested,
+                                     mimeType: contentType,
+                                     expectedBytes: expected,
+                                     error: error)
+            }
+        }
+        downloadTask = task
+        task.resume()
+    }
+
+    private func finishDownload(temporaryURL: URL?, status: Int, suggestedName: String?, mimeType: String?, expectedBytes: Int64, error: Error?) {
+        downloadTask = nil
+        guard error == nil, (200...299).contains(status), let temporaryURL,
+              expectedBytes <= Int64(ShellLimits.fileSize) else {
+            if let temporaryURL { try? FileManager.default.removeItem(at: temporaryURL) }
+            alertMessage = "파일을 저장하지 못했어요. 연결과 파일 크기(최대 40MB)를 확인한 뒤 다시 시도해 주세요."
             return
         }
+        let name = suggestedName ?? "download"
         do {
-            let destination = try makeDestination(name: suggestedFilename)
-            downloadDestination = destination
-            completionHandler(destination)
+            let destination = try makeDestination(name: name)
+            try FileManager.default.moveItem(at: temporaryURL, to: destination)
+            sharedFile = SharedFile(url: destination)
         } catch {
-            completionHandler(nil)
-            finishDownloadFailure()
+            try? FileManager.default.removeItem(at: temporaryURL)
+            alertMessage = "파일을 저장하지 못했어요. 저장 공간을 확인한 뒤 다시 시도해 주세요."
         }
-    }
-
-    func download(_ download: WKDownload, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, decisionHandler: @escaping (WKDownload.RedirectPolicy) -> Void) {
-        guard Site.isTrusted(request.url) else {
-            decisionHandler(.cancel)
-            finishDownloadFailure()
-            return
-        }
-        decisionHandler(.allow)
-    }
-
-    func downloadDidFinish(_ download: WKDownload) {
-        guard download === pendingDownload, let destination = downloadDestination else {
-            finishDownloadFailure()
-            return
-        }
-        pendingDownload = nil
-        downloadDestination = nil
-        sharedFile = SharedFile(url: destination)
-    }
-
-    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        guard download === pendingDownload else { return }
-        finishDownloadFailure()
-    }
-
-    private func finishDownloadFailure() {
-        pendingDownload?.cancel { _ in }
-        pendingDownload = nil
-        downloadDestination = nil
-        alertMessage = "파일을 저장하지 못했어요. 연결과 파일 크기(최대 40MB)를 확인한 뒤 다시 시도해 주세요."
+        _ = mimeType
     }
 
     // MARK: - Files built in the page (blob/data path)
@@ -390,7 +387,7 @@ final class WebShellModel: NSObject, ObservableObject {
         do {
             switch op {
             case "begin":
-                guard incoming == nil, pendingDownload == nil,
+                guard incoming == nil, downloadTask == nil,
                       let name = body["name"] as? String, name.utf8.count <= 400,
                       body["mime"] is String,
                       let size = body["size"] as? Int, size > 0, size <= ShellLimits.fileSize else {
@@ -477,7 +474,6 @@ final class WebShellModel: NSObject, ObservableObject {
     }
 
     private func trustedFrame(_ frame: WKFrameInfo) -> Bool {
-        guard Site.isTrustedOrigin(frame.securityOrigin), Site.isTrusted(webView.url) else { return false }
-        return true
+        Site.isTrustedOrigin(frame.securityOrigin) && Site.isTrusted(webView.url)
     }
 }
