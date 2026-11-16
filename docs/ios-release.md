@@ -46,14 +46,16 @@
   시스템 마이크 권한 팝업은 그대로 뜹니다.
 - Safe Area: 웹뷰를 세이프 에어리어 안에 두고(사이트가 `viewport-fit=cover`가 아님) 바깥은 사이트 배경색으로 채웁니다.
   노치·홈 인디케이터에 글자가 가리지 않고, 하단이 잘리지 않습니다.
-- 파일: 리포트·문서 내려받기는 `WKDownload`(서버 파일)와 페이지 내 blob/data 생성 파일 두 경로를 모두 받아
-  공유 시트로 넘깁니다. 단일 파일 40MB·오리진 검사·이름 정리 제한이 걸려 있습니다.
+- 파일: 교사 리포트 같은 서버 첨부 파일은 웹뷰 쿠키를 그대로 실은 `URLSession` 다운로드로, 페이지가 만든 blob/data 파일은
+  페이지 브리지로 받아 둘 다 공유 시트로 넘깁니다. 단일 파일 40MB·오리진 검사·이름 정리·시간 제한이 걸려 있습니다.
 
 ## 4. 검증 상태
 
-- `python3 native/ios/scripts/verify.py`: plist/프라이버시 매니페스트/에셋 JSON/프로젝트 파일/워크플로 정합성 통과.
-- GitHub Actions `iOS unsigned simulator build`: 전체 컴파일 확인용(결과는 Actions 화면 참조).
-- `iOS simulator launch smoke`: 시뮬레이터 설치·실행·스크린샷. 실기기 검증이 아닙니다.
+- `python3 native/ios/scripts/verify.py`: 81개 항목 통과(plist·프라이버시 매니페스트·에셋 JSON·pbxproj·스킴·워크플로).
+- `iOS unsigned simulator build` #43816376177: **success** — Swift 전체 컴파일, 코드 경고 없음.
+- `iOS simulator launch smoke` #43816586913: **success** — 시뮬레이터에 설치·실행 후 35초 시점 스크린샷에
+  라이브 사이트의 로그인 화면(ORUN HOMEWORK, 치이카와 테마, 접속 코드 입력)이 실제로 렌더링되었고 프로세스도 살아 있었습니다.
+  실기기 검증은 아닙니다.
 - **미검증**: 실제 아이폰에서의 녹음 음량·권한 팝업, 카메라/사진 선택, 파일 공유, iPad 레이아웃,
   App Store Connect 업로드·심사. 이 문서는 출시 승인을 주장하지 않습니다.
 
