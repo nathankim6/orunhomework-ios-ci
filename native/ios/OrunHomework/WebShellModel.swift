@@ -92,8 +92,8 @@ final class WebShellModel: NSObject, ObservableObject {
         fileProxy.owner = self
 
         let controller = webView.configuration.userContentController
-        controller.addScriptMessageHandler(shellProxy, contentWorld: .page, name: "orunShell")
-        controller.addScriptMessageHandler(fileProxy, contentWorld: .page, name: "orunFile")
+        controller.add(shellProxy, contentWorld: .page, name: "orunShell")
+        controller.add(fileProxy, contentWorld: .page, name: "orunFile")
         controller.addUserScript(WKUserScript(source: WebShellScripts.captureTracker,
                                              injectionTime: .atDocumentStart,
                                              forMainFrameOnly: true,
@@ -317,7 +317,7 @@ final class WebShellModel: NSObject, ObservableObject {
         download.delegate = self
     }
 
-    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping @MainActor @Sendable (URL?) -> Void) {
         guard download === pendingDownload,
               Site.isTrusted(response.url),
               let http = response as? HTTPURLResponse,
