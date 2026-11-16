@@ -50,7 +50,7 @@ private final class FileMessageProxy: NSObject, WKScriptMessageHandlerWithReply 
 /// document instead of a stored copy, (2) notice a new deployment when the app comes back
 /// to the foreground, and (3) keep recording, camera, file and link handling intact.
 @MainActor
-final class WebShellModel: NSObject, ObservableObject {
+final class WebShellModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     @Published private(set) var isLoading = true
     @Published private(set) var failure: String?
     @Published var sharedFile: SharedFile?
@@ -268,7 +268,7 @@ final class WebShellModel: NSObject, ObservableObject {
                 return
             }
             decisionHandler(.cancel)
-            startDownload(response.url)
+            if let url = response.url { startDownload(url) }
             return
         }
         decisionHandler(.allow)
